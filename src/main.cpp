@@ -1,74 +1,154 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <WebServer.h>
 #include <Arduino.h>
 #include <Wire.h>
+#include <AudioFileSourcePROGMEM.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutputI2S.h>
+#include "Alarm.mp3.h"
 
-#include "SparkFunCCS811.h" //Click here to get the library: http://librarymanager/All#SparkFun_CCS811
+#include <SparkFunCCS811.h>
+#include "SparkFunBME280.h"
 #include <FastLED.h>
+#include "secrets.hh"
 
-#define NUM_LEDS 8
-#define DATA_PIN 26
-#define CCS811_ADDR 0x5A
-// Replace the next variables with your SSID/Password combination
-const char *ssid = "REPLACE_WITH_YOUR_SSID";
-const char *password = "REPLACE_WITH_YOUR_PASSWORD";
-const char *mqtt_server = "192.168.1.144";
+constexpr int32_t NUM_LEDS = 8;
+constexpr uint8_t DATA_PIN = 26;
+constexpr uint8_t CCS811_ADDR = 0x5A; //or 0x5B
 
-const char *mqtt_server_user = "user";
-const char *mqtt_server_password = "password";
-const char *mqtt_topic = "esp32/1";
-
+//Managementobjekt für die RGB-LEDs
 CRGBArray<NUM_LEDS> leds;
 
-//#define CCS811_ADDR 0x5B //Default I2C Address
-//Alternate I2C Address
+//Managementobjekt für den CO2-Sensor
+CCS811 ccs811(CCS811_ADDR);
 
-CCS811 mySensor(CCS811_ADDR);
+//Managementobjekt für den Temperatur/Luftdruck/Luftfeuchtigkeitssensor
+BME280 bme280;
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+//Managementobjekte für die Sound-Wiedergabe
+AudioGeneratorMP3 *gen;
+AudioFileSourcePROGMEM *file;
+AudioOutputI2S *out;
+
+//Kommunikationsobjekt für WLAN
+WiFiClient wifiClient;
+
+//Kommunikationsobjekt für MQTT; nutzt WLAN
+PubSubClient mqttClient(wifiClient);
+
+//Kommunikationsobjekt Webserver
+WebServer httpServer(80);
+
+//"Datenmodell" durch einfache globale Variablen
+float temperature, humidity, pressure, co2;
+
+char jsonBuffer[300];
+
+enum class SoundState
+{
+  IDLE,
+  REQUEST_TO_PLAY,
+  PLAYING,
+  FINISHED,
+};
+
+SoundState soundState = SoundState::IDLE;
+
 long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-void callback(char *topic, byte *message, unsigned int length)
+//Funktion erzeugt dynamisches HTML - letztlich die Website, die darzustellen ist
+void handle_OnConnect()
+{
+  String ptr = "<!DOCTYPE html> <html>\n";
+  ptr += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">\n";
+  ptr += "<title>Barrierefreie Behaglichskeitsampel</title>\n";
+  ptr += "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}\n";
+  ptr += "body{margin-top: 50px;} h1 {color: #444444;margin: 50px auto 30px;}\n";
+  ptr += "p {font-size: 24px;color: #444444;margin-bottom: 10px;}\n";
+  ptr += "</style>\n";
+  ptr += "</head>\n";
+  ptr += "<body>\n";
+  ptr += "<div id=\"webpage\">\n";
+  ptr += "<h1>Barrierefreie Behaglichskeitsampel</h1>\n";
+  ptr += "<p>Temperatur: ";
+  ptr += temperature; //<<<<<================Hier wird zum Beispiel die aktuelle Temperatur dynamische ins HTML eingefügt
+  ptr += "&deg;C</p>";
+  ptr += "<p>Luftfreuchtigkeit: ";
+  ptr += humidity;
+  ptr += "%</p>";
+  ptr += "<p>Luftdruck: ";
+  ptr += pressure;
+  ptr += "hPa</p>";
+  ptr += "<p>Luftfreuchtigkeit: ";
+  ptr += humidity;
+  ptr += "%</p>";
+  ptr += "<p>CO2-Konzentration: ";
+  ptr += co2;
+  ptr += "ppm</p>";
+  ptr += "</div>\n";
+  ptr += "</body>\n";
+  ptr += "</html>\n";
+  httpServer.send(200, "text/html", ptr);
+}
+
+//Generiert eine einfache Fehlerseite
+void handle_NotFound()
+{
+  httpServer.send(404, "text/plain", "Not found");
+}
+
+//Funktion wird immer dann aufgerufen, wenn lab@home eine Nachricht über MQTT erhält - wird hier eigentlich nicht benötigt und ist nur "der Vollständigkeit halber" implementiert
+void mqttCallback(char *topic, byte *message, unsigned int length)
 {
   Serial.print("Message arrived on topic: ");
   Serial.print(topic);
-  Serial.print(". Message: ");
-  String messageTemp;
-
-  for (int i = 0; i < length; i++)
-  {
-    Serial.print((char)message[i]);
-    messageTemp += (char)message[i];
-  }
   Serial.println();
-
-  // Feel free to add more if statements to control more GPIOs with MQTT
 }
 
+//Funktion wird automatisch vom Framework einmalig beim einschalten bzw nach Reset aufgerufen
 void setup()
 {
+  //Richtet serielle Kommunikationsschnittstelle ein, damit die ganzen Meldungen am PC angezeigt werden können
   Serial.begin(115200);
-  Serial.println("CCS811 Basic Example");
+  Serial.println("W-HS IoT Barrierefreie Behaglichskeitsampel");
 
-  Wire.begin(21, 22); //Inialize I2C Hardware
+  //Legt fest, über welche Schnittstelle und welche Pins des ESP32 die Sound-Wiedergabe laufen soll
+  out = new AudioOutputI2S(0, 0);
+  out->SetPinout(27, 4, 25);
 
-  if (mySensor.begin() == false)
+  //Legt fest, über welche Pins die sog. I2C-Schnittstelle zur Anbindung der beiden verwendete Sensoren laufen soll
+  Wire.begin(21, 22);
+
+  //Legt die Bus-Adresse des BME280-Sensors fest
+  bme280.setI2CAddress(0x76);
+
+  //Baut die Verbindung mit dem CCS811 auf
+  if (ccs811.begin() == false)
   {
     Serial.print("CCS811 error. Please check wiring. Freezing...");
     while (1)
       ;
   }
+
+  //Baut die Verbindung mit dem BME280 auf
+  if (bme280.beginI2C() == false)
+  {
+    Serial.print("BME280 error. Please check wiring. Freezing...");
+    while (1)
+      ;
+  }
+
+  //Konfiguriert die RGB-Leds
   FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);
 
+  //Baut die Verbindung mit dem WLAN auf
   Serial.println();
   Serial.print("Connecting to ");
-  Serial.println(ssid);
-
-  WiFi.begin(ssid, password);
-
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
@@ -77,74 +157,99 @@ void setup()
 
   Serial.println("");
   Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-}
 
-void reconnect()
-{
-  // Loop until we're reconnected
-  while (!client.connected())
+  //Es wird hinterlegt, welche Funktionen aufzurufen sind, wenn ein Browser sich verbindet
+  //Wenn die "Hauptseite", also einfach "/" aufgerufen wird, dann soll handle_OnConnect aufgerufen werden
+  httpServer.on("/", handle_OnConnect);
+  //wenn etwas anderes aufgerufen wird, dann soll eine einfache Fehlerseite dargestellt werden
+  httpServer.onNotFound(handle_NotFound);
+
+  //Ab der nächsten Zeile ist der ESP32 für einen Webbrowser erreichbar, weil der sog "HTTP-Server" gestartet wird
+  httpServer.begin();
+  Serial.print("HTTP server started. Open http://");
+  Serial.print(WiFi.localIP());
+  Serial.println(" in your browser");
+
+  mqttClient.setServer(MQTT_SERVER, 1883);
+  mqttClient.setCallback(mqttCallback);
+  if (!mqttClient.connect("lab@home", MQTT_USER, MQTT_PASS))
   {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect("ESP32Client", mqtt_server_user, mqtt_server_password))
-    {
-      Serial.println("connected");
-      // Subscribe
-      client.subscribe("esp32/output");
-    }
-    else
-    {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
+    Serial.print("MQTT connection failed. Freezing...");
+    while (1)
+      ;
   }
 }
+
+void soundLoop()
+{
+  switch (soundState)
+  {
+  case SoundState::REQUEST_TO_PLAY:
+    file = new AudioFileSourcePROGMEM(Alarm_mp3, sizeof(Alarm_mp3));
+    gen = new AudioGeneratorMP3();
+    gen->begin(file, out);
+    soundState = SoundState::PLAYING;
+    //break;
+  case SoundState::PLAYING:
+    if (gen->isRunning() && !gen->loop()) { 
+      gen->stop();
+      file->close();
+      delete gen;
+      delete file;
+      soundState = SoundState::FINISHED;
+    } 
+    break;
+  default:
+    break;
+  }
+}
+
+uint32_t lastSensorUpdate = 0;
+uint32_t lastMQTTUpdate = 0;
 
 void loop()
 {
-  if (!client.connected())
-  {
-    reconnect();
-  }
-  client.loop();
+  mqttClient.loop();
+  httpServer.handleClient();
+  soundLoop();
+  //Hole die aktuelle Zeit
+  int now = millis();
 
-  //Check to see if data is ready with .dataAvailable()
-  if (mySensor.dataAvailable())
+  if (now - lastSensorUpdate > 5000)
   {
-    //If so, have the sensor read and calculate the results.
-    //Get them later
-    mySensor.readAlgorithmResults();
-
-    Serial.print("CO2[");
-    //Returns calculated CO2 reading
-    uint16_t co2 = mySensor.getCO2();
-    Serial.print(co2);
-    Serial.print("] tVOC[");
-    //Returns calculated TVOC reading
-    Serial.print(mySensor.getTVOC());
-    Serial.print("] millis[");
-    //Display the time since program start
-    Serial.print(millis());
-    Serial.print("]");
-    Serial.println();
-    CRGB col = co2 < 600 ? CRGB::Green : co2 < 1000 ? CRGB::Yellow
-                                                    : CRGB::Red;
-    for (int i = 0; i < NUM_LEDS; i++)
+    //Check to see if data is ready with .dataAvailable()
+    if (ccs811.dataAvailable())
     {
-      leds[i] = col;
-    }
-    FastLED.show();
-    char co2String[8];
-    dtostrf(co2, 1, 2, co2String);
-    client.publish("esp32/humidity", co2String);
-  }
+      //If so, have the sensor read and calculate the results.
+      ccs811.readAlgorithmResults();
+      co2 = ccs811.getCO2();
 
-  delay(500); //Don't spam the I2C bus
+      CRGB col = co2 < 600 ? CRGB::Green : co2 < 1000 ? CRGB::Yellow
+                                                      : CRGB::Red;
+      for (int i = 0; i < NUM_LEDS; i++)
+      {
+        leds[i] = col;
+      }
+      FastLED.show();
+  
+      if(co2>1000){
+        if(soundState==SoundState::IDLE) soundState=SoundState::REQUEST_TO_PLAY;
+      }
+      else{
+        if(soundState==SoundState::FINISHED) soundState=SoundState::IDLE;
+      }
+      
+    }
+    humidity=bme280.readFloatHumidity();
+    temperature = bme280.readTempC();
+    pressure=bme280.readFloatPressure();
+    snprintf ( jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":\"%f\",\"humidity\":\"%f\", \"pressure\":\"%f\", \"co2\":\"%f\"}", temperature, humidity, pressure, co2 );
+    Serial.println(jsonBuffer);
+    lastSensorUpdate = now;
+  }
+  if (now - lastMQTTUpdate > 20000)
+  {
+    mqttClient.publish("esp32/humidity", jsonBuffer);
+    lastMQTTUpdate=now;
+  }
 }
