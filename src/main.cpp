@@ -170,6 +170,7 @@ void setup()
   Serial.print(WiFi.localIP());
   Serial.println(" in your browser");
 
+  //Baut die Verbindung zum MQTT-Server auf
   mqttClient.setServer(MQTT_SERVER, 1883);
   mqttClient.setCallback(mqttCallback);
   if (!mqttClient.connect("lab@home", MQTT_USER, MQTT_PASS))
@@ -180,6 +181,7 @@ void setup()
   }
 }
 
+//Management-Routine für die Sound-Wiedergabe
 void soundLoop()
 {
   switch (soundState)
@@ -191,13 +193,14 @@ void soundLoop()
     soundState = SoundState::PLAYING;
     //break;
   case SoundState::PLAYING:
-    if (gen->isRunning() && !gen->loop()) { 
+    if (gen->isRunning() && !gen->loop())
+    {
       gen->stop();
       file->close();
       delete gen;
       delete file;
       soundState = SoundState::FINISHED;
-    } 
+    }
     break;
   default:
     break;
@@ -207,49 +210,65 @@ void soundLoop()
 uint32_t lastSensorUpdate = 0;
 uint32_t lastMQTTUpdate = 0;
 
+//Diese Funktion wird vom Framework immer und immer wieder aufgerufen
 void loop()
 {
+  //Sorge dafür, dass der mqttClient, der httpClient und die Sound-Wiedergabe ihren Aktivitäten nachgehen können
   mqttClient.loop();
   httpServer.handleClient();
   soundLoop();
   //Hole die aktuelle Zeit
   int now = millis();
 
+  //Hole alle 5 Sekunden Messdaten von den Sensoren
   if (now - lastSensorUpdate > 5000)
   {
     //Check to see if data is ready with .dataAvailable()
     if (ccs811.dataAvailable())
     {
-      //If so, have the sensor read and calculate the results.
       ccs811.readAlgorithmResults();
       co2 = ccs811.getCO2();
-
-      CRGB col = co2 < 600 ? CRGB::Green : co2 < 1000 ? CRGB::Yellow
-                                                      : CRGB::Red;
-      for (int i = 0; i < NUM_LEDS; i++)
-      {
-        leds[i] = col;
-      }
-      FastLED.show();
-  
-      if(co2>1000){
-        if(soundState==SoundState::IDLE) soundState=SoundState::REQUEST_TO_PLAY;
-      }
-      else{
-        if(soundState==SoundState::FINISHED) soundState=SoundState::IDLE;
-      }
-      
     }
-    humidity=bme280.readFloatHumidity();
+    humidity = bme280.readFloatHumidity();
     temperature = bme280.readTempC();
-    pressure=bme280.readFloatPressure();
-    snprintf ( jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":\"%f\",\"humidity\":\"%f\", \"pressure\":\"%f\", \"co2\":\"%f\"}", temperature, humidity, pressure, co2 );
+    pressure = bme280.readFloatPressure();
+    //...und gebe die aktuellen Messdaten auf der Console aus
+    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":\"%f\",\"humidity\":\"%f\", \"pressure\":\"%f\", \"co2\":\"%f\"}", temperature, humidity, pressure, co2);
     Serial.println(jsonBuffer);
+
+    //...und führe die Lampen-Sound-Logik aus
+
+    //Errechne ausgehend vom CO2-Messwert die anzuzeigende Farbe
+    CRGB col = CRGB::Green;
+    if (co2 > 1000)
+      col = CRGB::Red;
+    if (co2 > 600)
+      col = CRGB::Yellow;
+    //Setze alle acht Lampen auf den Farbwert
+    for (int i = 0; i < NUM_LEDS; i++)
+      leds[i] = col;
+    //und schreibe diesen Farbwert in die LEDs raus
+    FastLED.show();
+
+    //gebe außerdem der Sound-Wiedergabe vor, was Sie zu machen hat (Sound Starten bzw zurücksetzen)
+    if (co2 > 1000)
+    {
+      if (soundState == SoundState::IDLE)
+        soundState = SoundState::REQUEST_TO_PLAY;
+    }
+    else
+    {
+      if (soundState == SoundState::FINISHED)
+        soundState = SoundState::IDLE;
+    }
+
     lastSensorUpdate = now;
   }
+
+  //Schreibe alle 20 Sekunden die aktuellen Messwerte per MQTT raus
   if (now - lastMQTTUpdate > 20000)
   {
     mqttClient.publish("esp32/humidity", jsonBuffer);
-    lastMQTTUpdate=now;
+    lastMQTTUpdate = now;
   }
 }
