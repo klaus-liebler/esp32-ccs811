@@ -22,9 +22,11 @@ CRGBArray<NUM_LEDS> leds;
 
 //Managementobjekt für den CO2-Sensor
 CCS811 ccs811(CCS811_ADDR);
+bool css811_ok=false;
 
 //Managementobjekt für den Temperatur/Luftdruck/Luftfeuchtigkeitssensor
 BME280 bme280;
+bool bme280_ok=false;
 
 //Managementobjekte für die Sound-Wiedergabe
 AudioGeneratorMP3 *gen;
@@ -126,19 +128,18 @@ void setup()
   bme280.setI2CAddress(0x76);
 
   //Baut die Verbindung mit dem CCS811 auf
-  if (ccs811.begin() == false)
+  css811_ok = ccs811.begin();
+  if (!css811_ok)
   {
-    Serial.print("CCS811 error. Please check wiring. Freezing...");
-    while (1)
-      ;
+    Serial.print("CCS811 error. Please check wiring!");
   }
 
   //Baut die Verbindung mit dem BME280 auf
-  if (bme280.beginI2C() == false)
+  bme280_ok= bme280.beginI2C();
+  if (!bme280_ok)
   {
-    Serial.print("BME280 error. Please check wiring. Freezing...");
-    while (1)
-      ;
+    Serial.print("BME280 error. Please check wiring!");
+
   }
 
   //Konfiguriert die RGB-Leds
@@ -171,7 +172,7 @@ void setup()
   Serial.println(" in your browser");
 
   //Baut die Verbindung zum MQTT-Server auf
-  mqttClient.setServer(MQTT_SERVER, 1883);
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   if (!mqttClient.connect("lab@home", MQTT_USER, MQTT_PASS))
   {
@@ -224,16 +225,16 @@ void loop()
   if (now - lastSensorUpdate > 5000)
   {
     //Check to see if data is ready with .dataAvailable()
-    if (ccs811.dataAvailable())
+    if (css811_ok && ccs811.dataAvailable())
     {
       ccs811.readAlgorithmResults();
       co2 = ccs811.getCO2();
     }
-    humidity = bme280.readFloatHumidity();
-    temperature = bme280.readTempC();
-    pressure = bme280.readFloatPressure();
+    humidity = bme280_ok?bme280.readFloatHumidity():0.0;
+    temperature = bme280_ok?bme280.readTempC():0.0;
+    pressure = bme280_ok?bme280.readFloatPressure():0.0;
     //...und gebe die aktuellen Messdaten auf der Console aus
-    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":\"%f\",\"humidity\":\"%f\", \"pressure\":\"%f\", \"co2\":\"%f\"}", temperature, humidity, pressure, co2);
+    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":%f,\"humidity\":%f, \"pressure\":%f, \"co2\":%f}", temperature, humidity, pressure, co2);
     Serial.println(jsonBuffer);
 
     //...und führe die Lampen-Sound-Logik aus
@@ -268,7 +269,7 @@ void loop()
   //Schreibe alle 20 Sekunden die aktuellen Messwerte per MQTT raus
   if (now - lastMQTTUpdate > 20000)
   {
-    mqttClient.publish("esp32/humidity", jsonBuffer);
+    mqttClient.publish(MQTT_TOPIC, jsonBuffer);
     lastMQTTUpdate = now;
   }
 }
