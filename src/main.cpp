@@ -1,3 +1,4 @@
+#define EXTERNAL_I2S_DACxxx
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
@@ -31,7 +32,10 @@ bool bme280_ok=false;
 //Managementobjekte für die Sound-Wiedergabe
 AudioGeneratorMP3 *gen;
 AudioFileSourcePROGMEM *file;
+
 AudioOutputI2S *out;
+
+
 
 //Kommunikationsobjekt für WLAN
 WiFiClient wifiClient;
@@ -118,11 +122,16 @@ void setup()
   Serial.println("W-HS IoT Barrierefreie Behaglichskeitsampel");
 
   //Legt fest, über welche Schnittstelle und welche Pins des ESP32 die Sound-Wiedergabe laufen soll
+#ifdef EXTERNAL_I2S_DAC
   out = new AudioOutputI2S(0, 0);
   out->SetPinout(27, 4, 25);
+#else
+  out=new AudioOutputI2S(0, 1);
+#endif
+ 
 
   //Legt fest, über welche Pins die sog. I2C-Schnittstelle zur Anbindung der beiden verwendete Sensoren laufen soll
-  Wire.begin(21, 22);
+  Wire.begin(22, 21);
 
   //Legt die Bus-Adresse des BME280-Sensors fest
   bme280.setI2CAddress(0x76);
@@ -143,7 +152,7 @@ void setup()
   }
 
   //Konfiguriert die RGB-Leds
-  FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);
+  FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
 
   //Baut die Verbindung mit dem WLAN auf
   Serial.println();
@@ -214,6 +223,7 @@ uint32_t lastMQTTUpdate = 0;
 //Diese Funktion wird vom Framework immer und immer wieder aufgerufen
 void loop()
 {
+  
   //Sorge dafür, dass der mqttClient, der httpClient und die Sound-Wiedergabe ihren Aktivitäten nachgehen können
   mqttClient.loop();
   httpServer.handleClient();
@@ -240,11 +250,12 @@ void loop()
     //...und führe die Lampen-Sound-Logik aus
 
     //Errechne ausgehend vom CO2-Messwert die anzuzeigende Farbe
+    //#####################
+    //BITTE HIER ERGÄNZEN
     CRGB col = CRGB::Green;
-    if (co2 > 1000)
-      col = CRGB::Red;
-    if (co2 > 600)
-      col = CRGB::Yellow;
+    //#####################
+    
+      
     //Setze alle acht Lampen auf den Farbwert
     for (int i = 0; i < NUM_LEDS; i++)
       leds[i] = col;
@@ -269,7 +280,11 @@ void loop()
   //Schreibe alle 20 Sekunden die aktuellen Messwerte per MQTT raus
   if (now - lastMQTTUpdate > 20000)
   {
-    mqttClient.publish(MQTT_TOPIC, jsonBuffer);
+    if(mqttClient.publish(MQTT_TOPIC, jsonBuffer)){
+      Serial.println("Successfully published to MQTT Broker");
+    }else{
+      Serial.println("Error while publishing to MQTT Broker");
+    }
     lastMQTTUpdate = now;
   }
 }
