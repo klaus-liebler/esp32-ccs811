@@ -10,8 +10,9 @@
 #include "Alarm.mp3.h"
 
 #include <SparkFunCCS811.h>
-#include "SparkFunBME280.h"
-#include <FastLED.h>
+#include <SparkFunBME280.h>
+//#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 #include "secrets.hh"
 
 constexpr int32_t NUM_LEDS = 8;
@@ -19,7 +20,8 @@ constexpr uint8_t DATA_PIN = 26;
 constexpr uint8_t CCS811_ADDR = 0x5A; //or 0x5B
 
 //Managementobjekt für die RGB-LEDs
-CRGBArray<NUM_LEDS> leds;
+//CRGBArray<NUM_LEDS> leds;
+Adafruit_NeoPixel strip(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
 
 //Managementobjekt für den CO2-Sensor
 CCS811 ccs811(CCS811_ADDR);
@@ -70,7 +72,7 @@ void handle_OnConnect()
 {
   String ptr = "<!DOCTYPE html> <html>\n";
   ptr += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">\n";
-  ptr += "<title>Barrierefreie Behaglichskeitsampel</title>\n";
+  ptr += "<title>BeHampel</title>\n";
   ptr += "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}\n";
   ptr += "body{margin-top: 50px;} h1 {color: #444444;margin: 50px auto 30px;}\n";
   ptr += "p {font-size: 24px;color: #444444;margin-bottom: 10px;}\n";
@@ -78,7 +80,7 @@ void handle_OnConnect()
   ptr += "</head>\n";
   ptr += "<body>\n";
   ptr += "<div id=\"webpage\">\n";
-  ptr += "<h1>Barrierefreie Behaglichskeitsampel</h1>\n";
+  ptr += "<h1>BeHampel</h1>\n";
   ptr += "<p>Temperatur: ";
   ptr += temperature; //<<<<<================Hier wird zum Beispiel die aktuelle Temperatur dynamische ins HTML eingefügt
   ptr += "&deg;C</p>";
@@ -119,7 +121,7 @@ void setup()
 {
   //Richtet serielle Kommunikationsschnittstelle ein, damit die ganzen Meldungen am PC angezeigt werden können
   Serial.begin(115200);
-  Serial.println("W-HS IoT Barrierefreie Behaglichskeitsampel");
+  Serial.println("W-HS IoT BeHampel");
 
   //Legt fest, über welche Schnittstelle und welche Pins des ESP32 die Sound-Wiedergabe laufen soll
 #ifdef EXTERNAL_I2S_DAC
@@ -138,21 +140,29 @@ void setup()
 
   //Baut die Verbindung mit dem CCS811 auf
   css811_ok = ccs811.begin();
-  if (!css811_ok)
-  {
-    Serial.print("CCS811 error. Please check wiring!");
+  if (css811_ok){
+    Serial.println("CCS811 found and initialized.");
+  }
+  else{
+    Serial.println("CCS811 error. Please check wiring!");
   }
 
   //Baut die Verbindung mit dem BME280 auf
   bme280_ok= bme280.beginI2C();
-  if (!bme280_ok)
+  if (bme280_ok){
+    Serial.println("BME280 found and initialized.");
+  }
+  else
   {
-    Serial.print("BME280 error. Please check wiring!");
+    Serial.println("BME280 error. Please check wiring!");
 
   }
 
   //Konfiguriert die RGB-Leds
-  FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
+  strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
+  strip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
+  strip.setPixelColor(0, strip.Color(0, 0, 150));
+  strip.show();
 
   //Baut die Verbindung mit dem WLAN auf
   Serial.println();
@@ -183,7 +193,7 @@ void setup()
   //Baut die Verbindung zum MQTT-Server auf
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  if (!mqttClient.connect("lab@home", MQTT_USER, MQTT_PASS))
+  if (!mqttClient.connect("BeHampel-lab@home", MQTT_USER, MQTT_PASS))
   {
     Serial.print("MQTT connection failed. Freezing...");
     while (1)
@@ -249,18 +259,14 @@ void loop()
 
     //...und führe die Lampen-Sound-Logik aus
 
-    //Errechne ausgehend vom CO2-Messwert die anzuzeigende Farbe
+    //Errechne ausgehend vom CO2-Messwert die anzuzeigende Farbe (RGB-Darstellung), https://www.rapidtables.com/web/color/RGB_Color.html
     //#####################
     //BITTE HIER ERGÄNZEN
-    CRGB col = CRGB::Green;
+    uint32_t color = strip.Color(0, 0, 0);
     //#####################
     
-      
-    //Setze alle acht Lampen auf den Farbwert
-    for (int i = 0; i < NUM_LEDS; i++)
-      leds[i] = col;
-    //und schreibe diesen Farbwert in die LEDs raus
-    FastLED.show();
+    strip.setPixelColor(0, color);
+    strip.show();
 
     //gebe außerdem der Sound-Wiedergabe vor, was Sie zu machen hat (Sound Starten bzw zurücksetzen)
     if (co2 > 1000)
