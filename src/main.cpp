@@ -1,4 +1,3 @@
-#define EXTERNAL_I2S_DACxxx
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
@@ -16,12 +15,11 @@
 #include "secrets.hh"
 
 constexpr int32_t NUM_LEDS = 8;
-constexpr uint8_t DATA_PIN = 26;
+constexpr uint8_t NEOPIXEL_DATA_PIN = 26;
 constexpr uint8_t CCS811_ADDR = 0x5A; //or 0x5B
 
 //Managementobjekt für die RGB-LEDs
-//CRGBArray<NUM_LEDS> leds;
-Adafruit_NeoPixel strip(NUM_LEDS, DATA_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip(NUM_LEDS, NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
 
 //Managementobjekt für den CO2-Sensor
 CCS811 ccs811(CCS811_ADDR);
@@ -163,6 +161,8 @@ void setup()
   strip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
   strip.setPixelColor(0, strip.Color(0, 0, 150));
   strip.show();
+
+  soundState = SoundState::REQUEST_TO_PLAY;
 
   //Baut die Verbindung mit dem WLAN auf
   Serial.println();
