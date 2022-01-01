@@ -7,35 +7,51 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include "Alarm.mp3.h"
+#include <HTTPClient.h>
 
 #include <SparkFunCCS811.h>
 #include <SparkFunBME280.h>
-//#include <FastLED.h>
-#include <Adafruit_NeoPixel.h>
+#include "WS2812.hh"
+#include "owb.h"
+#include "owb_rmt.h"
+#include "ds18b20.h"
 #include "secrets.hh"
 
-constexpr int32_t NUM_LEDS = 8;
-constexpr uint8_t NEOPIXEL_DATA_PIN = 26;
+
+//Diverse konstante Werte werden gesetzt
+constexpr gpio_num_t PIN_LED_STRIP = GPIO_NUM_26;
+constexpr gpio_num_t PIN_ONEWIRE = GPIO_NUM_14;
+
+constexpr size_t LED_NUMBER = 8;
+constexpr uint32_t TIMEOUT_FOR_LED_STRIP = 1000;
+constexpr rmt_channel_t CHANNEL_WS2812 = RMT_CHANNEL_0;
+constexpr rmt_channel_t CHANNEL_ONEWIRE_TX = RMT_CHANNEL_1;
+constexpr rmt_channel_t CHANNEL_ONEWIRE_RX = RMT_CHANNEL_2;
+
 constexpr uint8_t CCS811_ADDR = 0x5A; //or 0x5B
+constexpr uint8_t BME280_ADDR = 0x76;
 
 //Managementobjekt für die RGB-LEDs
-Adafruit_NeoPixel strip(NUM_LEDS, NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
+WS2812_Strip<LED_NUMBER> *strip = NULL;
 
 //Managementobjekt für den CO2-Sensor
 CCS811 ccs811(CCS811_ADDR);
-bool css811_ok=false;
+bool css811_ok = false;
 
 //Managementobjekt für den Temperatur/Luftdruck/Luftfeuchtigkeitssensor
 BME280 bme280;
-bool bme280_ok=false;
+bool bme280_ok = false;
+
+//Managementobjekte für den präzisen Temperatursensor, der an Pin 14 (GPIO_NUM_14) hängt
+DS18B20_Info *ds18b20_info = NULL;
+owb_rmt_driver_info rmt_driver_info;
+OneWireBus *owb;
 
 //Managementobjekte für die Sound-Wiedergabe
 AudioGeneratorMP3 *gen;
 AudioFileSourcePROGMEM *file;
 
 AudioOutputI2S *out;
-
-
 
 //Kommunikationsobjekt für WLAN
 WiFiClient wifiClient;
@@ -65,39 +81,16 @@ long lastMsg = 0;
 char msg[50];
 int value = 0;
 
-//Funktion erzeugt dynamisches HTML - letztlich die Website, die darzustellen ist
-void handle_OnConnect()
+#include "index.html"
+
+void handle_httpGetRoot()
 {
-  String ptr = "<!DOCTYPE html> <html>\n";
-  ptr += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">\n";
-  ptr += "<title>BeHampel</title>\n";
-  ptr += "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}\n";
-  ptr += "body{margin-top: 50px;} h1 {color: #444444;margin: 50px auto 30px;}\n";
-  ptr += "p {font-size: 24px;color: #444444;margin-bottom: 10px;}\n";
-  ptr += "</style>\n";
-  ptr += "</head>\n";
-  ptr += "<body>\n";
-  ptr += "<div id=\"webpage\">\n";
-  ptr += "<h1>BeHampel</h1>\n";
-  ptr += "<p>Temperatur: ";
-  ptr += temperature; //<<<<<================Hier wird zum Beispiel die aktuelle Temperatur dynamische ins HTML eingefügt
-  ptr += "&deg;C</p>";
-  ptr += "<p>Luftfreuchtigkeit: ";
-  ptr += humidity;
-  ptr += "%</p>";
-  ptr += "<p>Luftdruck: ";
-  ptr += pressure;
-  ptr += "hPa</p>";
-  ptr += "<p>Luftfreuchtigkeit: ";
-  ptr += humidity;
-  ptr += "%</p>";
-  ptr += "<p>CO2-Konzentration: ";
-  ptr += co2;
-  ptr += "ppm</p>";
-  ptr += "</div>\n";
-  ptr += "</body>\n";
-  ptr += "</html>\n";
-  httpServer.send(200, "text/html", ptr);
+  httpServer.send(200, "text/html", index_html);
+}
+
+void handle_httpGetData()
+{
+  httpServer.send(200, "application/json", jsonBuffer);
 }
 
 //Generiert eine einfache Fehlerseite
@@ -114,6 +107,33 @@ void mqttCallback(char *topic, byte *message, unsigned int length)
   Serial.println();
 }
 
+// Called when a metadata event occurs (i.e. an ID3 tag, an ICY block, etc.
+void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string)
+{
+  const char *ptr = reinterpret_cast<const char *>(cbData);
+  (void)isUnicode; // Punt this ball for now
+  // Note that the type and string may be in PROGMEM, so copy them to RAM for printf
+  char s1[32], s2[64];
+  strncpy_P(s1, type, sizeof(s1));
+  s1[sizeof(s1) - 1] = 0;
+  strncpy_P(s2, string, sizeof(s2));
+  s2[sizeof(s2) - 1] = 0;
+  Serial.printf("METADATA(%s) '%s' = '%s'\n", ptr, s1, s2);
+  Serial.flush();
+}
+
+// Called when there's a warning or error (like a buffer underflow or decode hiccup)
+void StatusCallback(void *cbData, int code, const char *string)
+{
+  const char *ptr = reinterpret_cast<const char *>(cbData);
+  // Note that the string may be in PROGMEM, so copy it to RAM for printf
+  char s1[64];
+  strncpy_P(s1, string, sizeof(s1));
+  s1[sizeof(s1) - 1] = 0;
+  Serial.printf("STATUS(%s) '%d' = '%s'\n", ptr, code, s1);
+  Serial.flush();
+}
+
 //Funktion wird automatisch vom Framework einmalig beim einschalten bzw nach Reset aufgerufen
 void setup()
 {
@@ -126,41 +146,65 @@ void setup()
   out = new AudioOutputI2S(0, 0);
   out->SetPinout(27, 4, 25);
 #else
-  out=new AudioOutputI2S(0, 1);
+  out = new AudioOutputI2S(0, 1);
 #endif
- 
 
   //Legt fest, über welche Pins die sog. I2C-Schnittstelle zur Anbindung der beiden verwendete Sensoren laufen soll
   Wire.begin(22, 21);
 
   //Legt die Bus-Adresse des BME280-Sensors fest
-  bme280.setI2CAddress(0x76);
+  bme280.setI2CAddress(BME280_ADDR);
 
   //Baut die Verbindung mit dem CCS811 auf
   css811_ok = ccs811.begin();
-  if (css811_ok){
+  if (css811_ok)
+  {
     Serial.println("CCS811 found and initialized.");
   }
-  else{
+  else
+  {
     Serial.println("CCS811 error. Please check wiring!");
   }
 
   //Baut die Verbindung mit dem BME280 auf
-  bme280_ok= bme280.beginI2C();
-  if (bme280_ok){
+  bme280_ok = bme280.beginI2C();
+  if (bme280_ok)
+  {
     Serial.println("BME280 found and initialized.");
   }
   else
   {
     Serial.println("BME280 error. Please check wiring!");
-
   }
 
-  //Konfiguriert die RGB-Leds
-  strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-  strip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
-  strip.setPixelColor(0, strip.Color(0, 0, 150));
-  strip.show();
+  //Starte die OneWire-Bibliothek
+  Serial.println("Start DS18B20:");
+  owb=owb_rmt_initialize(&rmt_driver_info, PIN_ONEWIRE, CHANNEL_ONEWIRE_TX, CHANNEL_ONEWIRE_RX);
+  owb_use_crc(owb, true); // enable CRC check for ROM code
+  OneWireBus_ROMCode rom_code;
+  owb_status status = owb_read_rom(owb, &rom_code);
+  if (status == OWB_STATUS_OK)
+  {
+      ds18b20_info = ds18b20_malloc();                                 // heap allocation
+      ds18b20_init_solo(ds18b20_info, owb);                            // only one device on bus
+      ds18b20_use_crc(ds18b20_info, true);                             // enable CRC check on all reads
+      ds18b20_set_resolution(ds18b20_info, DS18B20_RESOLUTION_10_BIT); //10bit -->187ms Conversion time
+      ds18b20_convert_all(owb);
+  }
+  else
+  {
+    Serial.printf("An error occurred reading DS18B20 ROM code: %d", status);
+  }
+  Serial.println("DS18B20 started successfully");
+  
+  //Konfiguriert den 8fach-RGB-LED-Strip
+  strip = new WS2812_Strip<LED_NUMBER>(CHANNEL_WS2812);
+  ESP_ERROR_CHECK(strip->Init(PIN_LED_STRIP));
+  ESP_ERROR_CHECK(strip->Clear(TIMEOUT_FOR_LED_STRIP));
+  strip->SetPixel(0,CRGB::Red);
+  strip->SetPixel(1,CRGB::Green);
+  strip->SetPixel(2,CRGB::Yellow);
+  strip->Refresh(TIMEOUT_FOR_LED_STRIP);
 
   soundState = SoundState::REQUEST_TO_PLAY;
 
@@ -180,7 +224,9 @@ void setup()
 
   //Es wird hinterlegt, welche Funktionen aufzurufen sind, wenn ein Browser sich verbindet
   //Wenn die "Hauptseite", also einfach "/" aufgerufen wird, dann soll handle_OnConnect aufgerufen werden
-  httpServer.on("/", handle_OnConnect);
+  httpServer.on("/", handle_httpGetRoot);
+  //Die anzuzeigenden Daten werden nach dem erstmaligen Laden sekündlich aktualisiert. Dabei nutzt der Browser eine Technik namens "AJAX"
+  httpServer.on("/data", handle_httpGetData);
   //wenn etwas anderes aufgerufen wird, dann soll eine einfache Fehlerseite dargestellt werden
   httpServer.onNotFound(handle_NotFound);
 
@@ -199,6 +245,7 @@ void setup()
     while (1)
       ;
   }
+  soundState = SoundState::REQUEST_TO_PLAY;
 }
 
 //Management-Routine für die Sound-Wiedergabe
@@ -233,7 +280,7 @@ uint32_t lastMQTTUpdate = 0;
 //Diese Funktion wird vom Framework immer und immer wieder aufgerufen
 void loop()
 {
-  
+
   //Sorge dafür, dass der mqttClient, der httpClient und die Sound-Wiedergabe ihren Aktivitäten nachgehen können
   mqttClient.loop();
   httpServer.handleClient();
@@ -244,29 +291,42 @@ void loop()
   //Hole alle 5 Sekunden Messdaten von den Sensoren
   if (now - lastSensorUpdate > 5000)
   {
+
     //Check to see if data is ready with .dataAvailable()
     if (css811_ok && ccs811.dataAvailable())
     {
       ccs811.readAlgorithmResults();
       co2 = ccs811.getCO2();
     }
-    humidity = bme280_ok?bme280.readFloatHumidity():0.0;
-    temperature = bme280_ok?bme280.readTempC():0.0;
-    pressure = bme280_ok?bme280.readFloatPressure():0.0;
+    humidity = bme280_ok ? bme280.readFloatHumidity() : 0.0;
+    pressure = bme280_ok ? bme280.readFloatPressure() : 0.0;
+    pressure = pressure / 100;
+
+    //Hole die Temperatur vom präzisen OneWire-Sensor und starte direkt den nächsten Messzyklus
+    ds18b20_read_temp(ds18b20_info, &(temperature));
+    ds18b20_convert_all(owb);
+
+    const char *state = co2 < 800.0 ? "Gut" : "Schlecht";
     //...und gebe die aktuellen Messdaten auf der Console aus
-    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"temperature\":%f,\"humidity\":%f, \"pressure\":%f, \"co2\":%f}", temperature, humidity, pressure, co2);
+    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"state\":\"%s\",\"temperature\":%.1f,\"humidity\":%.0f, \"pressure\":%.0f, \"co2\":%.0f}", state, temperature, humidity, pressure, co2);
     Serial.println(jsonBuffer);
 
     //...und führe die Lampen-Sound-Logik aus
 
     //Errechne ausgehend vom CO2-Messwert die anzuzeigende Farbe (RGB-Darstellung), https://www.rapidtables.com/web/color/RGB_Color.html
     //#####################
-    //BITTE HIER ERGÄNZEN
-    uint32_t color = strip.Color(0, 0, 0);
+    //BITTE AB HIER VERÄNDERN
     //#####################
-    
-    strip.setPixelColor(0, color);
-    strip.show();
+
+    ESP_ERROR_CHECK(strip->Clear(TIMEOUT_FOR_LED_STRIP));
+    strip->SetPixel(0, CRGB::Blue);
+    strip->SetPixel(1, CRGB::Blue);
+    strip->SetPixel(2, CRGB::Blue);
+    ESP_ERROR_CHECK(strip->Refresh(TIMEOUT_FOR_LED_STRIP));
+
+    //#####################
+    //BITTE AB HIER NICHTS MEHR VERÄNDERN
+    //#####################
 
     //gebe außerdem der Sound-Wiedergabe vor, was Sie zu machen hat (Sound Starten bzw zurücksetzen)
     if (co2 > 1000)
@@ -286,9 +346,12 @@ void loop()
   //Schreibe alle 20 Sekunden die aktuellen Messwerte per MQTT raus
   if (now - lastMQTTUpdate > 20000)
   {
-    if(mqttClient.publish(MQTT_TOPIC, jsonBuffer)){
+    if (mqttClient.publish(MQTT_TOPIC, jsonBuffer))
+    {
       Serial.println("Successfully published to MQTT Broker");
-    }else{
+    }
+    else
+    {
       Serial.println("Error while publishing to MQTT Broker");
     }
     lastMQTTUpdate = now;
