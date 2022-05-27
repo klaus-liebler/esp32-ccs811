@@ -1,14 +1,17 @@
+#ifdef CORE_DEBUG_LEVEL
+#undef CORE_DEBUG_LEVEL
+#endif
+
+#define CORE_DEBUG_LEVEL 3
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
 #include <Arduino.h>
 #include <Wire.h>
-#include <AudioFileSourcePROGMEM.h>
-#include <AudioGeneratorMP3.h>
-#include <AudioOutputI2S.h>
-#include "Alarm.mp3.h"
+#include "MP3Player.hh"
 #include <HTTPClient.h>
-
+#include <driver/dac.h>
 #include <SparkFunCCS811.h>
 #include <SparkFunBME280.h>
 #include "WS2812.hh"
@@ -17,12 +20,24 @@
 #include "ds18b20.h"
 #include "secrets.hh"
 
+//Zugriff auf die Sound-Dateien und die HTML-Datei für den Webbrowser
+#define FLASH_FILE(x) \
+extern const uint8_t x##_start[] asm("_binary_" #x "_start");\
+extern const uint8_t x##_end[] asm("_binary_" #x "_end");\
+const size_t  x##_size{(x##_end)-(x##_start)};
+FLASH_FILE(speech_de_ready_mp3);
+FLASH_FILE(speech_de_air_quality_low_mp3);
+FLASH_FILE(music_fanfare_mp3);
+FLASH_FILE(html_index_html);
+FLASH_FILE(music_alarm14heulen_mp3);
+
 
 //Diverse konstante Werte werden gesetzt
-constexpr gpio_num_t PIN_LED_STRIP = GPIO_NUM_26;
+constexpr gpio_num_t PIN_LED_STRIP = GPIO_NUM_15;
 constexpr gpio_num_t PIN_ONEWIRE = GPIO_NUM_14;
+constexpr gpio_num_t PIN_LDR = GPIO_NUM_39;
 
-constexpr size_t LED_NUMBER = 8;
+constexpr size_t LED_NUMBER = 4;
 constexpr uint32_t TIMEOUT_FOR_LED_STRIP = 1000;
 constexpr rmt_channel_t CHANNEL_WS2812 = RMT_CHANNEL_0;
 constexpr rmt_channel_t CHANNEL_ONEWIRE_TX = RMT_CHANNEL_1;
@@ -47,11 +62,9 @@ DS18B20_Info *ds18b20_info = NULL;
 owb_rmt_driver_info rmt_driver_info;
 OneWireBus *owb;
 
-//Managementobjekte für die Sound-Wiedergabe
-AudioGeneratorMP3 *gen;
-AudioFileSourcePROGMEM *file;
-
-AudioOutputI2S *out;
+//Managementobjekt für die Sound-Wiedergabe
+MP3::Player mp3player;
+bool alreadyPlayedTheAlarmSound{false};
 
 //Kommunikationsobjekt für WLAN
 WiFiClient wifiClient;
@@ -63,7 +76,7 @@ PubSubClient mqttClient(wifiClient);
 WebServer httpServer(80);
 
 //"Datenmodell" durch einfache globale Variablen
-float temperature, humidity, pressure, co2;
+float temperature, humidity, pressure, co2, brightness;
 
 char jsonBuffer[300];
 
@@ -75,17 +88,9 @@ enum class SoundState
   FINISHED,
 };
 
-SoundState soundState = SoundState::IDLE;
-
-long lastMsg = 0;
-char msg[50];
-int value = 0;
-
-#include "index.html"
-
 void handle_httpGetRoot()
 {
-  httpServer.send(200, "text/html", index_html);
+  httpServer.send(200, "text/html", (const char*)html_index_html_start);
 }
 
 void handle_httpGetData()
@@ -140,21 +145,14 @@ void setup()
   //Richtet serielle Kommunikationsschnittstelle ein, damit die ganzen Meldungen am PC angezeigt werden können
   Serial.begin(115200);
   Serial.println("W-HS IoT BeHampel");
-
+  
   //Legt fest, über welche Schnittstelle und welche Pins des ESP32 die Sound-Wiedergabe laufen soll
-#ifdef EXTERNAL_I2S_DAC
-  out = new AudioOutputI2S(0, 0);
-  out->SetPinout(27, 4, 25);
-#else
-  out = new AudioOutputI2S(0, 1);
-#endif
+  mp3player.InitInternalDACMonoRightPin25();
 
   //Legt fest, über welche Pins die sog. I2C-Schnittstelle zur Anbindung der beiden verwendete Sensoren laufen soll
-  Wire.begin(22, 21);
+  Wire.begin(19, 22);
 
-  //Legt die Bus-Adresse des BME280-Sensors fest
-  bme280.setI2CAddress(BME280_ADDR);
-
+ 
   //Baut die Verbindung mit dem CCS811 auf
   css811_ok = ccs811.begin();
   if (css811_ok)
@@ -167,6 +165,7 @@ void setup()
   }
 
   //Baut die Verbindung mit dem BME280 auf
+  bme280.setI2CAddress(BME280_ADDR);
   bme280_ok = bme280.beginI2C();
   if (bme280_ok)
   {
@@ -197,16 +196,20 @@ void setup()
   }
   Serial.println("DS18B20 started successfully");
   
-  //Konfiguriert den 8fach-RGB-LED-Strip
+  //Konfiguriert den 4fach-RGB-LED-Strip
   strip = new WS2812_Strip<LED_NUMBER>(CHANNEL_WS2812);
   ESP_ERROR_CHECK(strip->Init(PIN_LED_STRIP));
   ESP_ERROR_CHECK(strip->Clear(TIMEOUT_FOR_LED_STRIP));
   strip->SetPixel(0,CRGB::Red);
   strip->SetPixel(1,CRGB::Green);
   strip->SetPixel(2,CRGB::Yellow);
+  strip->SetPixel(3,CRGB::Blue);
   strip->Refresh(TIMEOUT_FOR_LED_STRIP);
 
-  soundState = SoundState::REQUEST_TO_PLAY;
+ 
+
+  //Konfiguriert den analogen Eingang, an dem manchmal ein lichtabhängiger Widerstand angebracht ist
+  analogSetPinAttenuation(PIN_LDR, ADC_11db);
 
   //Baut die Verbindung mit dem WLAN auf
   Serial.println();
@@ -239,39 +242,14 @@ void setup()
   //Baut die Verbindung zum MQTT-Server auf
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  if (!mqttClient.connect("BeHampel-lab@home", MQTT_USER, MQTT_PASS))
+  if (!mqttClient.connect("BeHampel-lab@home"))
   {
-    Serial.print("MQTT connection failed. Freezing...");
-    while (1)
-      ;
+    Serial.print("MQTT connection failed. ");
   }
-  soundState = SoundState::REQUEST_TO_PLAY;
-}
-
-//Management-Routine für die Sound-Wiedergabe
-void soundLoop()
-{
-  switch (soundState)
-  {
-  case SoundState::REQUEST_TO_PLAY:
-    file = new AudioFileSourcePROGMEM(Alarm_mp3, sizeof(Alarm_mp3));
-    gen = new AudioGeneratorMP3();
-    gen->begin(file, out);
-    soundState = SoundState::PLAYING;
-    //break;
-  case SoundState::PLAYING:
-    if (gen->isRunning() && !gen->loop())
-    {
-      gen->stop();
-      file->close();
-      delete gen;
-      delete file;
-      soundState = SoundState::FINISHED;
-    }
-    break;
-  default:
-    break;
+  else{
+    Serial.println("Successfully connected to MQTT broker");
   }
+  mp3player.Play(speech_de_ready_mp3_start, speech_de_ready_mp3_size);
 }
 
 uint32_t lastSensorUpdate = 0;
@@ -284,7 +262,7 @@ void loop()
   //Sorge dafür, dass der mqttClient, der httpClient und die Sound-Wiedergabe ihren Aktivitäten nachgehen können
   mqttClient.loop();
   httpServer.handleClient();
-  soundLoop();
+  mp3player.Loop();
   //Hole die aktuelle Zeit
   int now = millis();
 
@@ -301,6 +279,7 @@ void loop()
     humidity = bme280_ok ? bme280.readFloatHumidity() : 0.0;
     pressure = bme280_ok ? bme280.readFloatPressure() : 0.0;
     pressure = pressure / 100;
+    brightness = analogRead(PIN_LDR);
 
     //Hole die Temperatur vom präzisen OneWire-Sensor und starte direkt den nächsten Messzyklus
     ds18b20_read_temp(ds18b20_info, &(temperature));
@@ -308,7 +287,7 @@ void loop()
 
     const char *state = co2 < 800.0 ? "Gut" : "Schlecht";
     //...und gebe die aktuellen Messdaten auf der Console aus
-    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"state\":\"%s\",\"temperature\":%.1f,\"humidity\":%.0f, \"pressure\":%.0f, \"co2\":%.0f}", state, temperature, humidity, pressure, co2);
+    snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"state\":\"%s\",\"temperature\":%.1f,\"humidity\":%.0f, \"pressure\":%.0f, \"co2\":%.0f, \"brightness\":%.0f}", state, temperature, humidity, pressure, co2, brightness);
     Serial.println(jsonBuffer);
 
     //...und führe die Lampen-Sound-Logik aus
@@ -317,27 +296,43 @@ void loop()
     //#####################
     //BITTE AB HIER VERÄNDERN
     //#####################
-
-    ESP_ERROR_CHECK(strip->Clear(TIMEOUT_FOR_LED_STRIP));
-    strip->SetPixel(0, CRGB::Blue);
-    strip->SetPixel(1, CRGB::Blue);
-    strip->SetPixel(2, CRGB::Blue);
-    ESP_ERROR_CHECK(strip->Refresh(TIMEOUT_FOR_LED_STRIP));
+  if(co2<600)
+  {
+    strip->SetPixel(0, CRGB::Green);
+    strip->SetPixel(1, CRGB::Black);
+    strip->SetPixel(2, CRGB::Black);
+    strip->SetPixel(3, CRGB::Black);
+  }
+  else if(co2<1000)
+  {
+    strip->SetPixel(0, CRGB::Black);
+    strip->SetPixel(1, CRGB::Yellow);
+    strip->SetPixel(2, CRGB::Black);
+    strip->SetPixel(3, CRGB::Black);
+  }
+ else
+  {
+    strip->SetPixel(0, CRGB::Black);
+    strip->SetPixel(1, CRGB::Black);
+    strip->SetPixel(2, CRGB::Red);
+    strip->SetPixel(3, CRGB::Black);
+  }
+  ESP_ERROR_CHECK(strip->Refresh(TIMEOUT_FOR_LED_STRIP));
 
     //#####################
     //BITTE AB HIER NICHTS MEHR VERÄNDERN
     //#####################
 
     //gebe außerdem der Sound-Wiedergabe vor, was Sie zu machen hat (Sound Starten bzw zurücksetzen)
-    if (co2 > 1000)
+    if (co2 >= 1000)
     {
-      if (soundState == SoundState::IDLE)
-        soundState = SoundState::REQUEST_TO_PLAY;
+      if (!alreadyPlayedTheAlarmSound)
+        mp3player.Play(music_alarm14heulen_mp3_start, music_alarm14heulen_mp3_size);
+        alreadyPlayedTheAlarmSound=true;
     }
     else
     {
-      if (soundState == SoundState::FINISHED)
-        soundState = SoundState::IDLE;
+      alreadyPlayedTheAlarmSound=false;
     }
 
     lastSensorUpdate = now;

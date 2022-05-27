@@ -1,0 +1,43 @@
+#ifdef CORE_DEBUG_LEVEL
+#undef CORE_DEBUG_LEVEL
+#endif
+
+#define CORE_DEBUG_LEVEL 3
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "MP3Player.hh"
+
+#include <driver/dac.h>
+
+
+//Zugriff auf die Sound-Dateien und die HTML-Datei für den Webbrowser
+#define FLASH_FILE(x) \
+extern const uint8_t x##_start[] asm("_binary_" #x "_start");\
+extern const uint8_t x##_end[] asm("_binary_" #x "_end");\
+const size_t  x##_size{(x##_end)-(x##_start)};
+FLASH_FILE(speech_de_air_quality_low_mp3);
+FLASH_FILE(music_fanfare_mp3);
+FLASH_FILE(html_index_html);
+FLASH_FILE(music_alarm14heulen_mp3);
+
+//Managementobjekt für die Sound-Wiedergabe
+MP3::Player* mp3player;
+
+void setup()
+{
+  
+  Serial.begin(115200);
+  Serial.println("W-HS IoT BeHampel");
+  mp3player=new MP3::Player();
+  mp3player->InitInternalDACMonoRightPin25(); 
+  mp3player->Play(music_fanfare_mp3_start, music_fanfare_mp3_size);
+}
+
+
+//Diese Funktion wird vom Framework immer und immer wieder aufgerufen
+void loop()
+{
+  mp3player->Loop();
+}
